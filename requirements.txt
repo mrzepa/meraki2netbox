@@ -1,0 +1,3 @@
+meraki~=1.46.0
+pynetbox~=7.3.3
+python-dotenv~=1.0.1
