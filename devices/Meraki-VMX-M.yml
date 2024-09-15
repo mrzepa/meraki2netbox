@@ -1,0 +1,16 @@
+---
+manufacturer: Cisco
+model: Meraki VMX-M
+slug: cisco-meraki-vmx-m
+part_number: VMX-M
+u_height: 0
+is_full_depth: false
+interfaces:
+  - name: Internet 1
+    type: 1000base-t
+  - name: Internet 2
+    type: 1000base-t
+  - name: Port 1
+    type: 1000base-t
+  - name: Port 2
+    type: 1000base-t
