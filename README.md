@@ -15,11 +15,11 @@ Keeping network documentation up-to-date can be a challenging task. This script 
 
 ## Prerequisites
 
-- **Python 3.6+**
+- **Python 3.12+**
 - **Pip** (Python package installer)
 - **Access to Meraki Dashboard API**: Requires an API key with read permissions.
 - **Access to NetBox API**: Requires an API token with write permissions.
-- **NetBox Instance**: A running NetBox instance (version 3.x recommended).
+- **NetBox Instance**: A running NetBox instance (version 3.7+ recommended).
 ### Installation
 
 1. **Clone the repository**:
@@ -53,25 +53,31 @@ Keeping network documentation up-to-date can be a challenging task. This script 
     TENANT_NAME=your_netbox_tenant_name
     DEBUG_LOGGING=0  # Set to '1' to enable debug logging
     ```
-* MERAKI_API_KEY: Your Meraki Dashboard API key.
-* MERAKI_ORG_ID: Your Meraki organization ID.
-* NETBOX_API_KEY: Your NetBox API token.
-* NETBOX_BASE_URL: The base URL of your NetBox instance (e.g., https://netbox.example.com).
-* TENANT_NAME: The name of the tenant in NetBox to associate with imported data.
-* DEBUG_LOGGING: Set to '1' to enable debug logging; otherwise, set to '0' or leave unset.
+   - MERAKI_API_KEY: Your Meraki Dashboard API key.
+   - MERAKI_ORG_ID: Your Meraki organization ID.
+   - NETBOX_API_KEY: Your NetBox API token.
+   - NETBOX_BASE_URL: The base URL of your NetBox instance (e.g., https://netbox.example.com).
+   - TENANT_NAME: The name of the tenant in NetBox to associate with imported data.
+   - DEBUG_LOGGING: Set to '1' to enable debug logging; otherwise, set to '0' or leave unset.
 
 3. **Configure NetBox Device Types:**
-- **Download Device Types**:
-  - Visit the NetBox Device Type Library: Device Type Library (https://github.com/netbox-community/devicetype-library/tree/master/device-types/Cisco).
-  - Download the YAML files for the Cisco Meraki devices you use (e.g., MX, MS, MR series).
-- **Import Device Types into NetBox**:
-  - Use NetBox's UI or API to import the device types.
-  - Alternatively, place the YAML files in a directory and use a script or plugin to batch import them.
-- **Custom Device Types**:
-  - If your devices are not available in the library, you may need to create custom device types following NetBox's guidelines.
-  - a devices directory is provided in this repo that contains additional device types
-
-### Usage
+   - **Download Device Types**:
+     - Visit the NetBox Device Type Library: Device Type Library (https://github.com/netbox-community/devicetype-library/tree/master/device-types/Cisco).
+     - Download the YAML files for the Cisco Meraki devices you use (e.g., MX, MS, MR series).
+   - **Import Device Types into NetBox**:
+     - Use NetBox's UI or API to import the device types.
+     - Alternatively, place the YAML files in a directory and use a script or plugin to batch import them.
+   - **Custom Device Types**:
+     - If your devices are not available in the library, you may need to create custom device types following NetBox's guidelines.
+     - a devices directory is provided in this repo that contains additional device types
+  
+4. **Configure NetBox Custom Fields**:
+    A custom field for the Site will be needed in order to track changes to a site name or address.
+    - **Customization -> Custom Fields**:
+      - Name: meraki_network_id
+      - Type: Text
+      - Object Types: site
+## Usage
 1. Run the script to fetch prefixes from Meraki and add them to NetBox:
    ```bash
    python main.py
