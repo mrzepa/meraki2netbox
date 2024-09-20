@@ -489,8 +489,33 @@ def process_network(network: Dict[str, Any]) -> None:
     try:
         vlans: List[Dict[str, Any]] = dashboard.appliance.getNetworkApplianceVlans(network_id)
         for vlan in vlans:
-            # ... rest of the VLAN processing code ...
-            pass  # Replace with actual code
+            vlan_id = vlan['id']
+            vlan_name = vlan['name']
+            prefix = vlan.get('subnet')
+            # check to see if the vlan already exists in Netbox, if not, create it.
+            nb_vlan = nb.ipam.vlans.get(name=vlan_name)
+            if not nb_vlan:
+                nb_vlan = nb.ipam.vlans.create(name=vlan_name,
+                                               vid=vlan_id,
+                                               tenant=tenant.id)
+                if nb_vlan:
+                    logger.info(f'Successfully added VLAN {nb_vlan}')
+                else:
+                    logger.error(f'Failed to add VLAN {vlan_name}')
+            # Check to see if the prefix exists, if not, create it
+            nb_prefix = nb.ipam.prefixes.get(prefix=prefix, vrf_id=vrf.id)
+            if not nb_prefix:
+
+                nb_prefix = nb.ipam.prefixes.create(prefix=prefix,
+                                                    site=nb_site.id,
+                                                    vrf=vrf.id,
+                                                    tenant=tenant.id,
+                                                    vlan=nb_vlan.id
+                                                    )
+                if nb_prefix:
+                    logger.info(f'Successfully added prefix {nb_prefix}')
+                else:
+                    logger.error(f'Failed to add prefix {prefix}')
     except meraki.exceptions.APIError as e:
         logger.error(f'Cannot get VLAN info for network {network_name}: {e}')
 
