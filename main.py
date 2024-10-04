@@ -1,8 +1,6 @@
 import logging
 import re
 import unicodedata
-from enum import verify
-
 import pycountry
 import meraki
 import os
