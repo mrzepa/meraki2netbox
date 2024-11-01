@@ -9,6 +9,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 import pynetbox
 import requests
+from icecream import ic
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import ipaddress
@@ -483,39 +484,57 @@ def process_network(network: Dict[str, Any]) -> None:
         if wan2Ip:
             add_interface_address(wan2Ip, 'Internet 2', nb_device, vrf, tenant)
 
-    # Proceed with VLAN and prefix processing
-    try:
-        vlans: List[Dict[str, Any]] = dashboard.appliance.getNetworkApplianceVlans(network_id)
-        for vlan in vlans:
-            vlan_id = vlan['id']
-            vlan_name = vlan['name']
-            prefix = vlan.get('subnet')
-            # check to see if the vlan already exists in Netbox, if not, create it.
-            nb_vlan = nb.ipam.vlans.get(name=vlan_name)
-            if not nb_vlan:
-                nb_vlan = nb.ipam.vlans.create(name=vlan_name,
-                                               vid=vlan_id,
-                                               tenant=tenant.id)
-                if nb_vlan:
-                    logger.info(f'Successfully added VLAN {nb_vlan}')
-                else:
-                    logger.error(f'Failed to add VLAN {vlan_name}')
-            # Check to see if the prefix exists, if not, create it
-            nb_prefix = nb.ipam.prefixes.get(prefix=prefix, vrf_id=vrf.id)
-            if not nb_prefix:
+    device_models = [device['model'] for device in devices]
+    has_appliance = any(model.startswith('MX') for model in device_models)
+    has_switch = any(model.startswith('MS') for model in device_models)
 
-                nb_prefix = nb.ipam.prefixes.create(prefix=prefix,
-                                                    site=nb_site.id,
-                                                    vrf=vrf.id,
-                                                    tenant=tenant.id,
-                                                    vlan=nb_vlan.id
-                                                    )
-                if nb_prefix:
-                    logger.info(f'Successfully added prefix {nb_prefix}')
-                else:
-                    logger.error(f'Failed to add prefix {prefix}')
-    except meraki.exceptions.APIError as e:
-        logger.error(f'Cannot get VLAN info for network {network_name}: {e}')
+    vlans = []
+    if has_appliance:
+        # Retrieve VLANs from appliance
+        try:
+            vlans = dashboard.appliance.getNetworkApplianceVlans(network_id)
+            logger.debug(f"Retrieved appliance VLANs for network {network_name}: {vlans}")
+        except meraki.exceptions.APIError as e:
+            logger.error(f'Cannot get appliance VLANs for network {network_name}: {e}')
+    elif has_switch:
+        # Retrieve VLANs from switch
+        try:
+            vlans = dashboard.switch.getNetworkSwitchVlans(network_id)
+            logger.debug(f"Retrieved switch VLANs for network {network_name}: {vlans}")
+        except meraki.exceptions.APIError as e:
+            logger.error(f'Cannot get switch VLANs for network {network_name}: {e}')
+    else:
+        logger.warning(f'No appliances or switches found in network "{network_name}". Skipping VLAN retrieval.')
+
+    # Proceed with VLAN and prefix processing
+    for vlan in vlans:
+        vlan_id = vlan['id']
+        vlan_name = vlan['name']
+        prefix = vlan.get('subnet')
+        # check to see if the vlan already exists in Netbox, if not, create it.
+        nb_vlan = nb.ipam.vlans.get(name=vlan_name, id=vlan_id)
+        if not nb_vlan:
+            nb_vlan = nb.ipam.vlans.create(name=vlan_name,
+                                           vid=vlan_id,
+                                           tenant=tenant.id)
+            if nb_vlan:
+                logger.info(f'Successfully added VLAN {nb_vlan}')
+            else:
+                logger.error(f'Failed to add VLAN {vlan_name}')
+        # Check to see if the prefix exists, if not, create it
+        nb_prefix = nb.ipam.prefixes.get(prefix=prefix, vrf_id=vrf.id)
+        if not nb_prefix:
+
+            nb_prefix = nb.ipam.prefixes.create(prefix=prefix,
+                                                site=nb_site.id,
+                                                vrf=vrf.id,
+                                                tenant=tenant.id,
+                                                vlan=nb_vlan.id
+                                                )
+            if nb_prefix:
+                logger.info(f'Successfully added prefix {nb_prefix}')
+            else:
+                logger.error(f'Failed to add prefix {prefix}')
 
 
 if __name__ == "__main__":
@@ -601,6 +620,7 @@ if __name__ == "__main__":
         logger.error('No Meraki networks found')
 
     max_workers: int = 5  # Adjust the number of workers as needed
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(process_network, network) for network in meraki_networks]
         for future in as_completed(futures):
