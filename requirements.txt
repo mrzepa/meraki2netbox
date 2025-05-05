@@ -1,4 +1,4 @@
-meraki~=1.49.0
+meraki~=2.0.2
 pynetbox~=7.4.0
 python-dotenv~=1.0.1
 pip~=24.2

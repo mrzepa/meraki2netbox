@@ -536,6 +536,18 @@ def process_network(network: Dict[str, Any]) -> None:
             else:
                 logger.error(f'Failed to add prefix {prefix}')
 
+    # Process NAT configurations
+    for translation in subnet_translations:
+        local_subnet = translation.get('localSubnet')
+        translated_subnet = translation.get('translatedSubnet')
+
+        if local_subnet and translated_subnet:
+            logger.info(
+                f"Network '{network_name}' has NAT configuration: {local_subnet} translated to {translated_subnet}")
+            # Add the translated subnet to NetBox
+            add_translated_subnet_to_netbox(local_subnet, translated_subnet, nb_site, vrf, tenant)
+        else:
+            logger.warning(f"Invalid NAT configuration in network '{network_name}': {translation}")
 
 if __name__ == "__main__":
 
