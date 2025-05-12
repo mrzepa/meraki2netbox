@@ -3,3 +3,4 @@ meraki_api__log__*
 *.log
 test.py
 logs
+config.py
