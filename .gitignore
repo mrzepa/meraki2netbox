@@ -1,5 +1,5 @@
 .env
 meraki_api__log__*
 *.log
-main_ORIG.py
+test.py
 logs

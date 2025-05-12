@@ -1,0 +1,15 @@
+from typing import Dict, Any, Optional, Tuple, List
+
+DEBUG: bool = False
+MAX_WORKERS: int = 5  # Adjust the number of workers as needed
+TENANT_NAME = "Vet Strategy"
+# Map device model prefixes to roles
+ROLE_MAPPING: Dict[str, str] = {
+    'MX': 'Security',
+    'MS': 'Switch',
+    'MR': 'Wireless',
+    'MV': 'Camera',
+    'MT': 'Sensor',
+    'MG': 'Cellular Gateway',
+    # Add more mappings as needed
+}

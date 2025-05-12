@@ -15,55 +15,19 @@ import threading
 import ipaddress
 from typing import Dict, Any, Optional, Tuple, List
 import time
+from slugify import slugify
+import config
+from utils import setup_logging, reverse_geocode
+from netbox_utils import get_role, add_device_to_netbox, add_interface_address, get_postable_fields
 
 load_dotenv()
-
-# Configure logging
-log_dir = 'logs'  # Directory to store log files
-os.makedirs(log_dir, exist_ok=True)
-
-# Generate unique filenames based on the current date and time
-timestamp: str = datetime.now().strftime('%Y%m%d_%H%M%S')
-info_log_filename: str = os.path.join(log_dir, f"info_{timestamp}.log")
-error_log_filename: str = os.path.join(log_dir, f"error_{timestamp}.log")
-debug_log_filename: str = os.path.join(log_dir, f"debug_{timestamp}.log")
-
-# Create logger
-logger: logging.Logger = logging.getLogger()
-logger.setLevel(logging.INFO)  # Set default level to INFO
-
-# Create formatters
-formatter: logging.Formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-
-# Create handlers
-info_handler: logging.Handler = logging.FileHandler(info_log_filename)
-info_handler.setLevel(logging.INFO)  # Capture INFO and above
-info_handler.setFormatter(formatter)
-
-error_handler: logging.Handler = logging.FileHandler(error_log_filename)
-error_handler.setLevel(logging.ERROR)  # Capture ERROR and above
-error_handler.setFormatter(formatter)
-
-# Add handlers to the logger
-logger.addHandler(info_handler)
-logger.addHandler(error_handler)
-
-# Also log to console (optional)
-console_handler: logging.Handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)  # Adjust as needed
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
+logger = logging.getLogger(__name__)
 
 # Check if debug logging is enabled via environment variable
-if os.getenv('DEBUG_LOGGING') == '1':
-    debug_handler: logging.Handler = logging.FileHandler(debug_log_filename)
-    debug_handler.setLevel(logging.DEBUG)
-    debug_handler.setFormatter(formatter)
-    logger.addHandler(debug_handler)
-    logger.setLevel(logging.DEBUG)  # Set logger level to DEBUG
-    logger.info('Debug logging is enabled.')
+if config.DEBUG:
+    setup_logging(logging.DEBUG)
 else:
-    logger.info('Debug logging is disabled.')
+    setup_logging(logging.INFO)
 
 # Suppress lower-level logs from third-party libraries (e.g., 'meraki' library)
 logging.getLogger('meraki').setLevel(logging.WARNING)
@@ -72,277 +36,14 @@ lock: threading.Lock = threading.Lock()
 nominatim_lock = threading.Lock()
 last_nominatim_request_time = 0.0
 
-def reverse_geocode(lat: float, lng: float) -> Optional[str]:
-    """
-    Perform reverse geocoding to get an address from latitude and longitude,
-    ensuring no more than one request per second is made to Nominatim.
 
-    Args:
-        lat (float): Latitude.
-        lng (float): Longitude.
-
-    Returns:
-        Optional[str]: The physical address or None if not found.
-    """
-    url = 'https://nominatim.openstreetmap.org/reverse'
-    params = {
-        'format': 'jsonv2',
-        'lat': lat,
-        'lon': lng,
-        'addressdetails': 1,
-    }
-    global last_nominatim_request_time
-    with nominatim_lock:
-        current_time = time.time()
-        time_since_last_request = current_time - last_nominatim_request_time
-        if time_since_last_request < 1.0:
-            # Need to wait for the remaining time
-            time_to_wait = 1.0 - time_since_last_request
-            logger.debug(f"Rate limiting in effect. Sleeping for {time_to_wait:.2f} seconds.")
-            time.sleep(time_to_wait)
-        # Update the last request time
-        last_nominatim_request_time = time.time()
-    # Make the request outside the lock to allow other threads to proceed
-    try:
-        response = requests.get(url, params=params, timeout=10, verify=False)
-        response.raise_for_status()
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        data = response.json()
-        address = data.get('display_name')
-        return address
-    except requests.RequestException as e:
-        logger.error(f'Reverse geocoding failed: {e}')
-        return None
-
-def slugify(input_string: str) -> str:
-    """
-    Convert a string to a slug suitable for URLs or filenames.
-
-    Args:
-        input_string (str): The string to slugify.
-
-    Returns:
-        str: The slugified string.
-    """
-    normalized_string: str = unicodedata.normalize('NFKD', input_string).encode('ascii', 'ignore').decode('ascii')
-    lower_string: str = normalized_string.lower()
-    cleaned_string: str = re.sub(r'[^a-z0-9\s-]', '', lower_string)
-    hyphenated_string: str = re.sub(r'[\s_]+', '-', cleaned_string)
-    slug: str = hyphenated_string.strip('-')
-    return slug
-
-def get_role(role_name: str) -> Optional[Any]:
-    """
-    Retrieve or create a device role in NetBox.
-
-    Args:
-        role_name (str): The name of the device role.
-
-    Returns:
-        Optional[Any]: The NetBox device role object or None if creation failed.
-    """
-    with lock:
-        role = existing_device_roles.get(role_name)
-        if not role:
-            # Define default attributes for the new role
-            role_data: Dict[str, Any] = {
-                'name': role_name,
-                'slug': slugify(role_name),
-                'color': '9e9e9e',  # Default color (grey)
-                'vm_role': False,
-            }
-            try:
-                role = nb.dcim.device_roles.create(role_data)
-                if role:
-                    existing_device_roles[role_name] = role
-                    logger.info(f'Successfully added role {role_name}')
-                else:
-                    logger.error(f'Failed to add role {role_name}')
-                    return None
-            except pynetbox.RequestError as e:
-                logger.error(f'Error creating role {role_name}: {e.error}')
-                return None
-    return role
-
-def add_device_to_netbox(device: Dict[str, Any], site: Any) -> Optional[Any]:
-    """
-    Add a device to NetBox.
-
-    Args:
-        device (Dict[str, Any]): The device information from Meraki.
-        site (Any): The NetBox site object where the device will be added.
-
-    Returns:
-        Optional[Any]: The NetBox device object or None if creation failed.
-    """
-    try:
-        device_name: str = device['name']
-        with lock:
-            nb_device = existing_devices.get(device_name)
-        if nb_device:
-            return nb_device
-        model: str = device.get('model')
-        nb_device_type = existing_device_types.get(model)
-        if not nb_device_type:
-            logger.error(f'Device type {model} not found in NetBox. Skipping device {device_name}')
-            return None
-
-        # Map device model prefixes to roles
-        role_mapping: Dict[str, str] = {
-            'MX': 'Security',
-            'MS': 'Switch',
-            'MR': 'Wireless',
-            'MV': 'Camera',
-            'MT': 'Sensor',
-            'MG': 'Cellular Gateway',
-            # Add more mappings as needed
-        }
-
-        device_role_name: str = 'Default'  # Default role if no match is found
-        for prefix, role_name in role_mapping.items():
-            if model.startswith(prefix):
-                device_role_name = role_name
-                break
-
-        nb_device_role = get_role(device_role_name)
-
-        device_data: Dict[str, Any] = {
-            'name': device_name,
-            'device_type': nb_device_type.id,
-            'serial': device.get('serial'),
-            'status': 'active',
-            'role': nb_device_role.id,
-            'site': site.id
-        }
-        nb_device = nb.dcim.devices.create(**device_data)
-        if nb_device:
-            with lock:
-                existing_devices[device_name] = nb_device
-            logger.info(f'Successfully added device {device_name} with role {device_role_name}')
-            return nb_device
-        else:
-            logger.error(f'Failed to add device {device_name}')
-    except pynetbox.RequestError as e:
-        logger.error(f'NetBox API Error while adding device {device_name}: {e.error}')
-    except Exception as e:
-        logger.error(f'Error: {e}')
-    return None
-
-def add_interface_address(address: str, interface_name: str, nb_device: Any, vrf: Any, tenant: Any) -> Optional[Any]:
-    """
-    Add an IP address to a device interface in NetBox.
-
-    Args:
-        address (str): The IP address to add.
-        interface_name (str): The name of the interface.
-        nb_device (Any): The NetBox device object.
-        vrf (Any): The VRF object.
-        tenant (Any): The tenant object.
-
-    Returns:
-        Optional[Any]: The NetBox IP address object or None if creation failed.
-    """
-    # Remove any existing prefix length
-    ip_no_prefix: str = address.split('/')[0]
-    logger.debug(f"Processing IP address: {address}, stripped to {ip_no_prefix}")
-
-    # Validate IP address
-    try:
-        ip_obj = ipaddress.ip_address(ip_no_prefix)
-        logger.debug(f"Validated IP address: {ip_no_prefix}")
-    except ValueError:
-        logger.error(f"Invalid IP address: {ip_no_prefix}")
-        return None
-
-    with lock:
-        device_interfaces = existing_interfaces.get(nb_device.id)
-    if not device_interfaces:
-        interfaces = nb.dcim.interfaces.filter(device_id=nb_device.id)
-        device_interfaces: Dict[str, Any] = {intf.name: intf for intf in interfaces}
-        with lock:
-            existing_interfaces[nb_device.id] = device_interfaces
-        logger.debug(f"Cached interfaces for device {nb_device.name}: {list(device_interfaces.keys())}")
-
-    nb_interface = device_interfaces.get(interface_name)
-    if not nb_interface:
-        logger.debug(f"Interface {interface_name} not found on device {nb_device.name}, creating new interface.")
-        try:
-            nb_interface = nb.dcim.interfaces.create(
-                device=nb_device.id,
-                name=interface_name,
-                type='virtual',
-            )
-            if nb_interface:
-                with lock:
-                    device_interfaces[interface_name] = nb_interface
-                logger.info(f"Successfully added interface {interface_name} on device {nb_device.name}")
-            else:
-                logger.error(f"Failed to add interface {interface_name} on device {nb_device.name}")
-                return None
-        except pynetbox.RequestError as e:
-            logger.error(f"Error creating interface {interface_name} on device {nb_device.name}: {e.error}")
-            return None
-    else:
-        logger.debug(f"Interface {interface_name} exists on device {nb_device.name}")
-
-    # Prepare the cache key with IP and VRF ID
-    vrf_id: Optional[int] = vrf.id if vrf else None
-    cache_key: Tuple[str, Optional[int]] = (ip_no_prefix, vrf_id)
-    with lock:
-        nb_ip = existing_ips.get(cache_key)
-        logger.debug(f"IP {ip_no_prefix} with VRF {vrf_id} lookup in cache returned: {nb_ip}")
-
-    if not nb_ip:
-        # Determine prefix length
-        if ip_obj.version == 6:
-            address_with_prefix: str = f"{ip_no_prefix}/128"
-        else:
-            address_with_prefix: str = f"{ip_no_prefix}/32"
-
-        logger.debug(f"Creating new IP address: {address_with_prefix}")
-        try:
-            nb_ip = nb.ipam.ip_addresses.create(
-                address=address_with_prefix,
-                vrf=vrf.id,
-                tenant=tenant.id,
-                assigned_object_type="dcim.interface",
-                assigned_object_id=nb_interface.id
-            )
-            if nb_ip:
-                with lock:
-                    existing_ips[cache_key] = nb_ip
-                logger.info(f"Successfully added IP address {address_with_prefix}")
-                return nb_ip
-            else:
-                logger.error(f"Failed to add IP address {address_with_prefix}")
-        except pynetbox.RequestError as e:
-            logger.error(f"Error creating IP address {address_with_prefix}: {e.error}")
-            return None
-    else:
-        logger.debug(f"IP address {ip_no_prefix} found in cache: {nb_ip}")
-        # Update assignment if necessary
-        try:
-            if nb_ip.assigned_object_id != nb_interface.id:
-                logger.debug(f"Updating IP address {ip_no_prefix} assignment to interface {interface_name}")
-                nb_ip.assigned_object_type = "dcim.interface"
-                nb_ip.assigned_object_id = nb_interface.id
-                nb_ip.save()
-                logger.info(f"Updated IP address {ip_no_prefix} assignment to interface {interface_name}")
-            else:
-                logger.debug(f"IP address {ip_no_prefix} already assigned to interface {interface_name}")
-            return nb_ip
-        except pynetbox.RequestError as e:
-            logger.error(f"Error updating IP address {ip_no_prefix}: {e.error}")
-            return None
-
-def process_network(network: Dict[str, Any]) -> None:
+def process_network(network: Dict[str, Any], devices_by_network) -> None:
     """
     Process a Meraki network and synchronize its data to NetBox.
 
     Args:
         network (Dict[str, Any]): The network information from Meraki.
-
+        devices_by_network: List of all devices grouped by network.
     Returns:
         None
     """
@@ -352,17 +53,13 @@ def process_network(network: Dict[str, Any]) -> None:
     logger.debug(f'Network ID: {network_id}')
 
     # Fetch devices to obtain physical address or coordinates
-    devices: List[Dict[str, Any]] = []
-    try:
-        devices = dashboard.networks.getNetworkDevices(network_id)
-    except meraki.exceptions.APIError as e:
-        logger.error(f'Cannot get devices for network {network_name}: {e}')
-        return
+    devices = devices_by_network.get(network_id, [])
 
     # Try to get physical address from devices
     physical_address: Optional[str] = None
     lat: Optional[float] = None
     lng: Optional[float] = None
+    notes: Optional[str] = None
 
     if devices:
         # First, try to get the address from devices
@@ -393,7 +90,7 @@ def process_network(network: Dict[str, Any]) -> None:
         logger.warning(f'No physical address found for network "{network_name}".')
         physical_address = 'NO ADDRESS CONFIGURED'
 
-    # Proceed with VRF creation (remains the same)
+    # Due to the possibility of overlapping subnets, each site will need to have its own VRF in netbox.
     vrf_name: str = f'vrf_{network_name}'
     with lock:
         vrf = existing_vrfs.get(vrf_name)
@@ -442,8 +139,10 @@ def process_network(network: Dict[str, Any]) -> None:
             updated = True
         if updated:
             try:
-                nb_site.save()
-                logger.info(f'Successfully updated site "{network_name}"')
+                if nb_site.save():
+                    logger.info(f'Successfully updated site "{network_name}"')
+                else:
+                    logger.error(f'Failed to update site "{network_name}"')
             except pynetbox.RequestError as e:
                 logger.error(f'Failed to update site "{network_name}": {e.error}')
         else:
@@ -471,8 +170,9 @@ def process_network(network: Dict[str, Any]) -> None:
             logger.error(f'Error creating site "{network_name}": {e.error}')
             return
 
+    # now add the devices themselves to Netbox
     for device in devices:
-        nb_device = add_device_to_netbox(device, nb_site)
+        nb_device = add_device_to_netbox(nb, device, nb_site, existing_device_types, existing_device_roles, existing_devices)
         if not nb_device:
             continue
 
@@ -480,9 +180,9 @@ def process_network(network: Dict[str, Any]) -> None:
         wan2Ip: Optional[str] = device.get('wan2Ip')
 
         if wan1Ip:
-            add_interface_address(wan1Ip, 'Internet 1', nb_device, vrf, tenant)
+            add_interface_address(nb, wan1Ip, 'Internet 1', nb_device, vrf, tenant, existing_interfaces, existing_ips)
         if wan2Ip:
-            add_interface_address(wan2Ip, 'Internet 2', nb_device, vrf, tenant)
+            add_interface_address(nb, wan2Ip, 'Internet 2', nb_device, vrf, tenant, existing_interfaces, existing_ips)
 
     device_models = [device['model'] for device in devices]
     has_appliance = any(model.startswith('MX') for model in device_models)
@@ -514,6 +214,7 @@ def process_network(network: Dict[str, Any]) -> None:
         # check to see if the vlan already exists in Netbox, if not, create it.
         nb_vlan = nb.ipam.vlans.get(name=vlan_name, id=vlan_id)
         if not nb_vlan:
+            logger.debug(f'Creating VLAN {vlan_name} with ID {vlan_id} in Netbox')
             nb_vlan = nb.ipam.vlans.create(name=vlan_name,
                                            vid=vlan_id,
                                            tenant=tenant.id)
@@ -524,30 +225,191 @@ def process_network(network: Dict[str, Any]) -> None:
         # Check to see if the prefix exists, if not, create it
         nb_prefix = nb.ipam.prefixes.get(prefix=prefix, vrf_id=vrf.id)
         if not nb_prefix:
-
-            nb_prefix = nb.ipam.prefixes.create(prefix=prefix,
-                                                site=nb_site.id,
-                                                vrf=vrf.id,
-                                                tenant=tenant.id,
-                                                vlan=nb_vlan.id
-                                                )
+            logger.debug(f'Creating prefix {prefix} in Netbox')
+            prefix_data = {"prefix": prefix,
+                           "vrf": vrf.id,
+                           "tenant": tenant.id,
+                           "vlan": nb_vlan.id}
+            if SITE_SCOPE:
+                prefix_data["scope_type"] = 'dcim.site'
+                prefix_data["scope_id"] = nb_site.id
+            else:
+                prefix_data["site"] = nb_site.id
+            nb_prefix = nb.ipam.prefixes.create(**prefix_data)
             if nb_prefix:
                 logger.info(f'Successfully added prefix {nb_prefix}')
             else:
                 logger.error(f'Failed to add prefix {prefix}')
 
-    # Process NAT configurations
-    for translation in subnet_translations:
-        local_subnet = translation.get('localSubnet')
-        translated_subnet = translation.get('translatedSubnet')
+def process_local_devices(network_id: str) -> None:
+    # This is not complete. Need more work to identify the local devices.
+    local_devices = get_network_clients(network_id)
+    for local_device in local_devices:
+        description = local_device.get('description')
+        ip = local_device.get('ip')
+        mac = local_device.get('mac')
+        manufacturer = local_device.get('manufacturer')
+        device_role_name = "Generic Endpoint"
+        logger.debug(f'Checking for device role "{device_role_name}" in Netbox')
+        device_role = existing_device_roles.get(device_role_name)
+        if not device_role:
+            device_role = nb.dcim.device_roles.get(name=device_role_name)
+            if device_role:
+                existing_device_roles[device_role_name] = device_role
+                logger.debug(f'Found device role "{device_role_name}" in Netbox')
+            else:
+                logger.error(f'Could not find device role "{device_role_name}" in Netbox.')
+                return
 
-        if local_subnet and translated_subnet:
-            logger.info(
-                f"Network '{network_name}' has NAT configuration: {local_subnet} translated to {translated_subnet}")
-            # Add the translated subnet to NetBox
-            add_translated_subnet_to_netbox(local_subnet, translated_subnet, nb_site, vrf, tenant)
+        device_type_name = "Generic_Device"
+        logger.debug(f'Checking for device type "{device_type_name}" in Netbox')
+        device_type = existing_device_types.get(device_type_name)
+        if not device_type:
+            device_type = nb.dcim.device_types.get(model=device_type_name)
+            if device_type:
+                existing_device_types[device_type_name] = device_type
+                logger.debug(f'Found device type "{device_type_name}" in Netbox')
+            else:
+                logger.error(f'Could not find device type "{device_type_name}" in Netbox.')
+                return
+        device_data = {
+            'name': description,
+            'device_role': device_role.id,
+            'device_type': device_type.id,
+        }
+        if manufacturer:
+            device_data['description'] = f'MAC Manufacturer: {manufacturer}'
+
+        # Meraki lists the ip address as a /32, to properly add it to netbox, we need to find it's netmask.
+        if ip:
+            logger.debug(f'Checking for ip {ip} in Netbox.')
+            # Convert the IP string to an IP address object
+            ip_addr = ipaddress.ip_address(ip)
+
+            # Get all prefixes for the site
+            prefixes = nb.ipam.prefixes.filter(location_id=site.location.id if site.location else site.id)
+
+            for prefix in prefixes:
+                ip_network = ipaddress.ip_network(prefix.prefix)
+                if ip_addr in ip_network:
+                    logger.debug(f"IP {ip} belongs to prefix {prefix.prefix} at site {nb_site.name}")
+                    prefix_length = ip_network.prefixlen
+                    break
+            else:
+                logger.error(f'Could not find a prefix for {ip} at site {nb_site.name}')
+                continue
+            ip_address = f'{ip}/{prefix_length}'
+            nb_ip = nb.ipam.ip_addresses.get(address=ip_address, vrf=vrf.id)
+            if not nb_ip:
+                nb_ip = nb.ipam.ip_addresses.create(address=ip_address, vrf=vrf.id, tenant=tenant.id)
+                if nb_ip:
+                    logger.info(f'Successfully added IP address {ip_address} to site {nb_site.name}')
+                else:
+                    logger.error(f'Failed to add IP address {ip_address} to site {nb_site.name}')
+
+            device_data['primary_ip4'] = nb_ip.id if nb_ip else None
+
+        logger.debug(f'Adding device {description} to site {nb_site.name}')
+        nb_local_device = nb.dcim.devices.create(**device_data)
+        if nb_local_device:
+            logger.info(f'Successfully added device {description} to site {nb_site.name}')
         else:
-            logger.warning(f"Invalid NAT configuration in network '{network_name}': {translation}")
+            logger.error(f'Failed to add device {description} to site {nb_site.name}')
+            continue
+
+        if mac:
+            nb_interface = nb.dcim.interfaces.get(device_id=nb_local_device.id, name='eth0')
+            if not nb_interface:
+                logger.error(f'Could not get interface eth0 for device {description} at site {nb_site.name}')
+                continue
+
+            nb_local_mac = get_existing_mac(mac)
+            if not nb_local_mac:
+                logger.debug(f'Adding MAC address {mac} to device {description} at site {nb_site.name}')
+                mac_data = {
+                    'address': mac,
+                    'assigned_object_type': 'dcim.interface',
+                    'assigned_object_id': nb_interface.id,
+                    'device': nb_local_device.id
+                }
+                nb_local_mac = nb.dcim.mac_addresses.create(**mac_data)
+
+                if nb_local_mac:
+                    logger.info(f'Successfully added MAC address {mac} to device {description} at site {nb_site.name}')
+                else:
+                    logger.error(f'Failed to add MAC address {mac} to device {description} at site {nb_site.name}')
+                    continue
+
+            # Set this as the primary MAC address for the interface
+            interface_update = {
+                'primary_mac_address': nb_local_mac.id
+            }
+            nb.dcim.interfaces.update([{'id': interface.id, **interface_update}])
+
+def get_existing_mac(mac_address: str) -> Optional[Any]:
+    """
+    Check if a MAC address already exists in NetBox.
+
+    Args:
+        mac_address (str): The MAC address to check
+
+    Returns:
+        Optional[Any]: The existing MAC address object or None
+    """
+    try:
+        existing = nb.dcim.mac_addresses.filter(address=mac_address)
+        return next(iter(existing), None)
+    except Exception as e:
+        logger.error(f'Error checking existing MAC address: {str(e)}')
+        return None
+
+def get_organization_devices(org_id: str) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Get all devices from the organization and organize them by network.
+
+    Args:
+        org_id: The organization ID
+
+    Returns:
+        Dict mapping network IDs to lists of devices
+    """
+    try:
+        # Get all devices at organization level
+        devices = dashboard.organizations.getOrganizationDevices(
+            organizationId=org_id,
+            total_pages='all'
+        )
+
+        # Group devices by network
+        devices_by_network: Dict[str, List[Dict[str, Any]]] = {}
+        for device in devices:
+            network_id = device.get('networkId')
+            if network_id:
+                if network_id not in devices_by_network:
+                    devices_by_network[network_id] = []
+                devices_by_network[network_id].append(device)
+
+        logger.info(f"Retrieved {len(devices)} devices across {len(devices_by_network)} networks")
+        return devices_by_network
+
+    except meraki.exceptions.APIError as e:
+        logger.error(f"Failed to get organization devices: {e}")
+        raise
+
+def get_network_clients(network_id: str) -> List[Dict]:
+    try:
+        # Get all clients that have connected in the last hour
+        clients = dashboard.networks.getNetworkClients(
+            networkId=network_id,
+            timespan=3600,  # Last hour
+            perPage=1000,
+            total_pages='all'
+        )
+        return clients
+    except meraki.exceptions.APIError as e:
+        logger.error(f"Error getting network clients: {e}")
+        return []
+
 
 if __name__ == "__main__":
 
@@ -555,7 +417,7 @@ if __name__ == "__main__":
     MERAKI_ORG_ID: str = os.getenv('MERAKI_ORG_ID')
     NETBOX_API_KEY: str = os.getenv('NETBOX_API_KEY')
     NETBOX_BASE_URL: str = os.getenv('NETBOX_BASE_URL')
-    TENANT_NAME: str = os.getenv('TENANT_NAME')  # Read tenant name from .env file
+    TENANT_NAME: str = config.TENANT_NAME
 
     # Initialize the Meraki dashboard API
     dashboard = meraki.DashboardAPI(MERAKI_API_KEY, output_log=False)
@@ -590,8 +452,9 @@ if __name__ == "__main__":
     existing_regions: Dict[str, Any] = {region.name: region for region in nb.dcim.regions.all()}
     logger.debug(f"Cached regions: {list(existing_regions.keys())}")
 
+    nb_cisco = nb.dcim.manufacturers.get(name="Cisco")
     existing_device_types: Dict[str, Any] = {}
-    for dt in nb.dcim.device_types.all():
+    for dt in nb.dcim.device_types.filter(manufacturer_id=nb_cisco.id):
         if dt.part_number:
             existing_device_types[dt.part_number] = dt
         if dt.model:
@@ -622,21 +485,32 @@ if __name__ == "__main__":
         existing_ips[key] = ip
     logger.debug(f"Cached IP addresses with VRF IDs: {list(existing_ips.keys())}")
 
+    # Need to determine which attributes to use based on the netbox version.
+    available_fields = get_postable_fields(NETBOX_BASE_URL, NETBOX_API_KEY,
+                                           'ipam/prefixes')
+    if 'site' in available_fields:
+        SITE_SCOPE = False
+    if 'scope_type' in available_fields:
+        SITE_SCOPE = True
+
     existing_vrfs: Dict[str, Any] = {vrf.name: vrf for vrf in nb.ipam.vrfs.all()}
     logger.debug(f"Cached VRFs: {list(existing_vrfs.keys())}")
 
     meraki_networks: List[Dict[str, Any]] = dashboard.organizations.getOrganizationNetworks(MERAKI_ORG_ID)
+
     if meraki_networks:
-        logger.info('Retrieved Meraki networks')
+        logger.info(f"Found {len(meraki_networks)} networks to process")
     else:
         logger.error('No Meraki networks found')
 
-    max_workers: int = 5  # Adjust the number of workers as needed
+    # Get all devices and organize them by network
+    devices_by_network = get_organization_devices(MERAKI_ORG_ID)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(process_network, network) for network in meraki_networks]
+    with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
+        futures = [executor.submit(process_network, network, devices_by_network) for network in meraki_networks]
         for future in as_completed(futures):
             try:
                 future.result()
             except Exception as e:
-                logger.error(f'Error processing network: {e}')
+                logger.exception(f'Error processing network: {e}')
+
